@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""ASUS ScreenPad Plus input daemon: absolute touch  <->  relative trackpad.
+
+GNOME/mutter treats both built-in ELAN panels as "built-in" touchscreens and
+maps the ScreenPad's touch to the *primary* display, so raw ScreenPad touches
+drive the main screen. To fix that we EVIOCGRAB the real ScreenPad touchscreen
+(so the compositor stops seeing it) and re-inject the input through our own
+*virtual* devices:
+
+  * absolute mode (default): a virtual touchscreen that clones the real device's
+    axes + INPUT_PROP_DIRECT. Because it is NOT built-in, mutter maps it by
+    physical size -- which matches DP-1 (the ScreenPad) -- so touches land on the
+    ScreenPad like a normal touchscreen.
+  * trackpad mode: a virtual relative pointer (1-finger move, tap=left,
+    2-finger scroll, 2-finger tap=right, 3-finger tap=middle).
+
+SIGUSR1 toggles the mode; SIGTERM exits cleanly (releasing the grab). The
+current mode is written to ~/.cache/screenpad-trackpad.mode.
+
+Device auto-detect: the widest-aspect multitouch screen is the ScreenPad
+(override with SCREENPAD_TOUCH_NAME=<substring>).
+
+Trackpad tunables (env): SCREENPAD_TRACKPAD_GAIN / SENS / SCROLL.
+"""
+import os
+import sys
+import signal
+import subprocess
+import selectors
+from evdev import InputDevice, UInput, list_devices, ecodes as e, AbsInfo
+
+GAIN_PX = float(os.environ.get("SCREENPAD_TRACKPAD_GAIN", "3000"))
+SENS = float(os.environ.get("SCREENPAD_TRACKPAD_SENS", "1.3"))
+SCROLL_SENS = float(os.environ.get("SCREENPAD_TRACKPAD_SCROLL", "0.02"))
+NAME_OVERRIDE = os.environ.get("SCREENPAD_TOUCH_NAME")
+
+TAP_TIME = 0.18
+TAP_MOVE_FRAC = 0.06
+CLAMP = 40
+
+_CACHE = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+MODE_FILE = os.path.join(_CACHE, "screenpad-trackpad.mode")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def notify(summary, body=""):
+    try:
+        subprocess.run(["notify-send", "-a", "ScreenPad", "-t", "1500",
+                        summary, body], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def find_touchscreens():
+    out = []
+    for path in list_devices():
+        try:
+            d = InputDevice(path)
+        except Exception:
+            continue
+        absd = dict(d.capabilities().get(e.EV_ABS, []))
+        keys = d.capabilities().get(e.EV_KEY, [])
+        if (e.ABS_MT_POSITION_X in absd and e.ABS_MT_POSITION_Y in absd
+                and e.BTN_TOUCH in keys):
+            out.append((d, absd[e.ABS_MT_POSITION_X], absd[e.ABS_MT_POSITION_Y]))
+        else:
+            d.close()
+    return out
+
+
+def pick_screenpad(cands):
+    if NAME_OVERRIDE:
+        for d, ax, ay in cands:
+            if NAME_OVERRIDE in d.name:
+                return d, ax, ay
+        log(f"no touchscreen matched SCREENPAD_TOUCH_NAME={NAME_OVERRIDE!r}; "
+            "using widest-aspect auto-detect")
+    best = None
+    for d, ax, ay in cands:
+        h = ay.max - ay.min
+        if h <= 0:
+            continue
+        aspect = (ax.max - ax.min) / h
+        if best is None or aspect > best[-1]:
+            best = (d, ax, ay, aspect)
+    return best[:3] if best else None
+
+
+class Daemon:
+    def __init__(self, dev, ax, ay):
+        self.dev = dev
+        self.ax, self.ay = ax, ay
+        self.xr = (ax.max - ax.min) or 1
+        self.gain = GAIN_PX * SENS / self.xr
+        self.mode = "absolute"
+        self.running = True
+        self.want_switch = False
+
+        # Virtual touchscreen: clone the real device's ABS axes + keys and mark
+        # INPUT_PROP_DIRECT (so libinput treats it as a touchscreen). But OVERRIDE
+        # the X/Y axes so the reported physical size is 309x91mm -- inside mutter's
+        # 5% size-match window for DP-1 (the ScreenPad, ~308-310 x 90-93mm) and far
+        # from eDP-1 (the main panel). That makes mutter map this device to the
+        # ScreenPad instead of falling back to the builtin monitor.
+        # (mutter meta-input-mapper: MAX_SIZE_MATCH_DIFF = 0.05, both axes.)
+        self.NX, self.NY, RES = 3090, 910, 10        # 3090/10=309mm, 910/10=91mm
+        yr = (ay.max - ay.min) or 1
+        self.sx = self.NX / self.xr
+        self.sy = self.NY / yr
+        self.XCODES = {e.ABS_X, e.ABS_MT_POSITION_X, e.ABS_MT_TOOL_X}
+        self.YCODES = {e.ABS_Y, e.ABS_MT_POSITION_Y, e.ABS_MT_TOOL_Y}
+        caps = dev.capabilities(absinfo=True)
+        new_abs = []
+        for code, ai in caps.get(e.EV_ABS, []):
+            if code in self.XCODES:
+                ai = AbsInfo(0, 0, self.NX, 0, 0, RES)
+            elif code in self.YCODES:
+                ai = AbsInfo(0, 0, self.NY, 0, 0, RES)
+            new_abs.append((code, ai))
+        ts_caps = {e.EV_ABS: new_abs, e.EV_KEY: caps.get(e.EV_KEY, [])}
+        self.ts = UInput(ts_caps, name="ScreenPad Virtual Touch",
+                         input_props=[e.INPUT_PROP_DIRECT],
+                         vendor=0x04f3, product=0x9009)
+        # Virtual relative pointer for trackpad mode.
+        self.pt = UInput(
+            {e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL],
+             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE]},
+            name="ScreenPad Virtual Trackpad")
+
+        # shared MT parse state
+        self.cur = 0
+        self.slots = {}            # slot -> {'x','y','id'} (trackpad)
+        self.ts_active = set()     # slots currently down on the virtual TS
+        # trackpad gesture state
+        self._reset_gesture()
+
+    def _reset_gesture(self):
+        self.last_px = self.last_py = self.last_sy = None
+        self.last_n = 0
+        self.g_t0 = None
+        self.g_maxf = 0
+        self.g_move = 0.0
+
+    # ---- mode switching -------------------------------------------------
+    def write_mode(self):
+        try:
+            os.makedirs(_CACHE, exist_ok=True)
+            with open(MODE_FILE, "w") as f:
+                f.write(self.mode + "\n")
+        except OSError:
+            pass
+
+    def release_ts(self):
+        for slot in list(self.ts_active):
+            self.ts.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+            self.ts.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        if self.ts_active:
+            self.ts.write(e.EV_KEY, e.BTN_TOUCH, 0)
+            self.ts.syn()
+        self.ts_active.clear()
+
+    def do_switch(self):
+        self.mode = "trackpad" if self.mode == "absolute" else "absolute"
+        # clean up the device we're leaving so nothing is left "held"
+        self.release_ts()
+        self._reset_gesture()
+        self.write_mode()
+        log(f"mode -> {self.mode}")
+        notify("ScreenPad: trackpad" if self.mode == "trackpad"
+               else "ScreenPad: touch", )
+
+    # ---- absolute (passthrough) -----------------------------------------
+    def forward(self, ev):
+        if ev.type == e.EV_SYN and ev.code == e.SYN_REPORT:
+            self.ts.syn()
+            return
+        if ev.type == e.EV_ABS and ev.code == e.ABS_MT_TRACKING_ID:
+            if ev.value == -1:
+                self.ts_active.discard(self.cur)
+            else:
+                if self.cur in self.ts_active:
+                    # firmware double-tracking-id bug: lift before re-press
+                    self.ts.write(e.EV_ABS, e.ABS_MT_SLOT, self.cur)
+                    self.ts.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+                    self.ts.syn()
+                self.ts_active.add(self.cur)
+        if ev.type in (e.EV_ABS, e.EV_KEY):
+            val = ev.value
+            if ev.code in self.XCODES:
+                val = min(self.NX, max(0, round(val * self.sx)))
+            elif ev.code in self.YCODES:
+                val = min(self.NY, max(0, round(val * self.sy)))
+            self.ts.write(ev.type, ev.code, val)
+
+    # ---- trackpad (relative) --------------------------------------------
+    def _clamp(self, v):
+        return max(-CLAMP, min(CLAMP, v))
+
+    def click(self, btn):
+        self.pt.write(e.EV_KEY, btn, 1)
+        self.pt.syn()
+        self.pt.write(e.EV_KEY, btn, 0)
+        self.pt.syn()
+
+    def trackpad_frame(self, now):
+        n = len(self.slots)
+        if n > 0 and self.last_n == 0:
+            self.g_t0, self.g_maxf, self.g_move = now, n, 0.0
+        self.g_maxf = max(self.g_maxf, n)
+        if n != self.last_n:
+            self.last_px = self.last_py = self.last_sy = None
+
+        if n == 1:
+            s = self.slots[min(self.slots)]
+            if 'x' in s and 'y' in s:
+                if self.last_px is not None:
+                    dx, dy = s['x'] - self.last_px, s['y'] - self.last_py
+                    self.g_move += (abs(dx) + abs(dy)) / self.xr
+                    mdx, mdy = int(round(dx * self.gain)), int(round(dy * self.gain))
+                    if mdx:
+                        self.pt.write(e.EV_REL, e.REL_X, self._clamp(mdx))
+                    if mdy:
+                        self.pt.write(e.EV_REL, e.REL_Y, self._clamp(mdy))
+                    if mdx or mdy:
+                        self.pt.syn()
+                self.last_px, self.last_py = s['x'], s['y']
+        elif n == 2:
+            ys = [v['y'] for v in self.slots.values() if 'y' in v]
+            if len(ys) == 2:
+                avg = sum(ys) / 2.0
+                if self.last_sy is not None:
+                    dsy = avg - self.last_sy
+                    self.g_move += abs(dsy) / self.xr
+                    ticks = int(-dsy * SCROLL_SENS)
+                    if ticks:
+                        self.pt.write(e.EV_REL, e.REL_WHEEL, self._clamp(ticks))
+                        self.pt.syn()
+                        self.last_sy = avg
+                else:
+                    self.last_sy = avg
+
+        if n == 0 and self.last_n > 0:
+            dt = (now - self.g_t0) if self.g_t0 else 99
+            if dt < TAP_TIME and self.g_move < TAP_MOVE_FRAC:
+                btn = (e.BTN_LEFT if self.g_maxf <= 1
+                       else e.BTN_RIGHT if self.g_maxf == 2 else e.BTN_MIDDLE)
+                self.click(btn)
+            self.g_t0, self.g_maxf, self.g_move = None, 0, 0.0
+            self.last_px = self.last_py = self.last_sy = None
+
+        self.last_n = n
+
+    # ---- main dispatch --------------------------------------------------
+    def handle(self, ev):
+        # maintain shared MT parse (used by trackpad mode)
+        if ev.type == e.EV_ABS:
+            if ev.code == e.ABS_MT_SLOT:
+                self.cur = ev.value
+            elif ev.code == e.ABS_MT_TRACKING_ID:
+                if ev.value == -1:
+                    self.slots.pop(self.cur, None)
+                else:
+                    self.slots.setdefault(self.cur, {})['id'] = ev.value
+            elif ev.code == e.ABS_MT_POSITION_X:
+                self.slots.setdefault(self.cur, {})['x'] = ev.value
+            elif ev.code == e.ABS_MT_POSITION_Y:
+                self.slots.setdefault(self.cur, {})['y'] = ev.value
+
+        if self.mode == "absolute":
+            self.forward(ev)
+        elif ev.type == e.EV_SYN and ev.code == e.SYN_REPORT:
+            self.trackpad_frame(ev.timestamp())
+
+    def run(self):
+        self.dev.grab()
+        self.write_mode()
+        log(f"grabbed {self.dev.name!r} ({self.dev.path}); mode={self.mode}")
+        sel = selectors.DefaultSelector()
+        sel.register(self.dev, selectors.EVENT_READ)
+        try:
+            while self.running:
+                if self.want_switch:
+                    self.want_switch = False
+                    self.do_switch()
+                for key, _ in sel.select(timeout=0.2):
+                    try:
+                        for ev in self.dev.read():
+                            self.handle(ev)
+                    except BlockingIOError:
+                        pass
+        finally:
+            try:
+                self.release_ts()
+            except Exception:
+                pass
+            try:
+                self.dev.ungrab()
+            except Exception:
+                pass
+            self.ts.close()
+            self.pt.close()
+            log("released")
+
+
+def main():
+    cands = find_touchscreens()
+    if not cands:
+        log("error: no multitouch touchscreen (need read access to "
+            "/dev/input/event* via the plugdev udev rule)")
+        return 1
+    pick = pick_screenpad(cands)
+    if not pick:
+        log("error: could not select a ScreenPad touchscreen")
+        return 1
+    dev, ax, ay = pick
+    for d, _, _ in cands:
+        if d.path != dev.path:
+            d.close()
+    log(f"ScreenPad: {dev.name!r} ({dev.path}) x[{ax.min},{ax.max}] "
+        f"y[{ay.min},{ay.max}] aspect {(ax.max-ax.min)/max(ay.max-ay.min,1):.2f}")
+
+    daemon = Daemon(dev, ax, ay)
+    signal.signal(signal.SIGUSR1, lambda *_: setattr(daemon, "want_switch", True))
+    signal.signal(signal.SIGTERM, lambda *_: setattr(daemon, "running", False))
+    signal.signal(signal.SIGINT, lambda *_: setattr(daemon, "running", False))
+    daemon.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

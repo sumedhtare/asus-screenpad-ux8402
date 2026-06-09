@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Control the ScreenPad Plus input daemon (systemd user service).
+#
+# The daemon always runs and grabs the ScreenPad touchscreen so it never leaks
+# to the main screen. It has two modes:
+#   absolute  - ScreenPad touch controls the ScreenPad (default, normal touch)
+#   trackpad  - ScreenPad surface is a relative trackpad for the main cursor
+#
+# Super+F6 -> `screenpad-trackpad toggle` flips between them.
+#
+# Usage: screenpad-trackpad [toggle|trackpad|touch|status|restart]
+set -u
+
+SVC=screenpad-trackpad.service
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}"
+MODE_FILE="$CACHE/screenpad-trackpad.mode"
+
+uctl() { systemctl --user "$@"; }
+cur_mode() { cat "$MODE_FILE" 2>/dev/null || echo unknown; }
+
+ensure_running() {
+  uctl is-active --quiet "$SVC" && return 0
+  uctl start "$SVC" 2>/dev/null || { echo "failed to start $SVC" >&2; return 1; }
+  sleep 0.4
+}
+
+# The touch digitizer is powered with the panel backlight, so the panel must be
+# lit for either mode to receive anything.
+panel_on() { "$HOME/.local/bin/screenpad-toggle" on >/dev/null 2>&1; }
+
+flip() { uctl kill -s SIGUSR1 "$SVC"; sleep 0.25; }
+
+set_mode() {  # $1 = desired mode
+  ensure_running || return 1
+  panel_on
+  [ "$(cur_mode)" = "$1" ] || flip
+  echo "ScreenPad mode: $(cur_mode)"
+}
+
+case "${1:-toggle}" in
+  toggle)   ensure_running || exit 1; panel_on; flip; echo "ScreenPad mode: $(cur_mode)" ;;
+  trackpad) set_mode trackpad ;;
+  touch|absolute) set_mode absolute ;;
+  status)   uctl is-active --quiet "$SVC" && echo "daemon: active, mode: $(cur_mode)" || echo "daemon: inactive" ;;
+  restart)  uctl restart "$SVC"; sleep 0.4; echo "restarted; mode: $(cur_mode)" ;;
+  *) echo "usage: $0 [toggle|trackpad|touch|status|restart]" >&2; exit 1 ;;
+esac

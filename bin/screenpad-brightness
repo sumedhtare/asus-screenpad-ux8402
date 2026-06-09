@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Step the ASUS ScreenPad Plus brightness. Usage: screenpad-brightness up|down
+# Tracks level in a state file because the driver reports a bogus current value.
+DEV="asus_screenpad"
+STATE="${XDG_CACHE_HOME:-$HOME/.cache}/screenpad-brightness.level"
+OFF_FLAG="${XDG_CACHE_HOME:-$HOME/.cache}/screenpad-display.off"
+BL_POWER="/sys/class/backlight/$DEV/bl_power"
+
+# Do nothing while the ScreenPad is toggled off, otherwise changing brightness
+# re-powers the panel. Truth = the toggle's off-flag, or bl_power==1.
+if [ -e "$OFF_FLAG" ] || [ "$(cat "$BL_POWER" 2>/dev/null)" = "1" ]; then
+  echo "ScreenPad is off; ignoring brightness change (toggle it on with Super+F8)." >&2
+  exit 0
+fi
+
+MAX=$(brightnessctl -d "$DEV" max 2>/dev/null); MAX=${MAX:-235}
+STEP=$(( MAX / 10 )); [ "$STEP" -lt 1 ] && STEP=1
+
+CUR=$(cat "$STATE" 2>/dev/null)
+case "$CUR" in (*[!0-9]*|'') CUR=$(( MAX / 2 ));; esac
+[ "$CUR" -gt "$MAX" ] && CUR=$MAX
+
+case "$1" in
+  up)   NEW=$(( CUR + STEP ));;
+  down) NEW=$(( CUR - STEP ));;
+  *) echo "usage: $0 up|down" >&2; exit 1;;
+esac
+[ "$NEW" -gt "$MAX" ] && NEW=$MAX
+[ "$NEW" -lt 0 ] && NEW=0
+
+mkdir -p "$(dirname "$STATE")"
+if ! brightnessctl -d "$DEV" set "$NEW" >/dev/null; then
+  echo "screenpad-brightness: failed to set brightness on '$DEV'" >&2
+  echo "  If this says 'Permission denied', your session isn't in the 'video' group yet." >&2
+  echo "  Log out and back in (group membership only applies to new logins)." >&2
+  exit 1
+fi
+# Only record the new level once the write actually succeeded.
+echo "$NEW" > "$STATE"
+echo "ScreenPad brightness: $NEW / $MAX"

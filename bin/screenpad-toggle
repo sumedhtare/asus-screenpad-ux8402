@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Toggle the ASUS ScreenPad Plus (DP-1) on/off via GNOME mutter's DisplayConfig.
+
+Uses ApplyMonitorsConfig with method=2 (PERSISTENT) so the choice is written to
+~/.config/monitors.xml and mutter re-applies it across wake / hotplug / login,
+instead of being reverted like a raw `xrandr --off`.
+
+Usage: screenpad-toggle [on|off|toggle]   (default: toggle)
+"""
+import os
+import sys
+import time
+import subprocess
+import gi
+from gi.repository import Gio, GLib
+
+TARGET = "DP-1"          # the ScreenPad output
+DP1_SCALE = 1.5          # match the primary panel's scale (must be in supported scales)
+BL_DEV = "asus_screenpad"
+BL_POWER = f"/sys/class/backlight/{BL_DEV}/bl_power"
+_CACHE = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+# Shared with ~/.local/bin/screenpad-brightness so up/down stays in sync.
+LEVEL_FILE = os.path.join(_CACHE, "screenpad-brightness.level")
+# Read by screenpad-brightness to refuse re-lighting the panel while off.
+OFF_FLAG = os.path.join(_CACHE, "screenpad-display.off")
+
+
+def bctl(*args):
+    return subprocess.run(["brightnessctl", "-d", BL_DEV, *args],
+                          capture_output=True, text=True)
+
+
+def set_bl_power(value):
+    """Write bl_power (0=on, 1=off). Returns True if it took effect.
+
+    bl_power is root-owned by default; needs the udev rule that grants the
+    'video' group write access (see setup notes)."""
+    try:
+        with open(BL_POWER, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError:
+        return False
+
+
+def backlight_off():
+    """Power the backlight off. Flag the off-state for the brightness keys."""
+    os.makedirs(_CACHE, exist_ok=True)
+    cur = bctl("get").stdout.strip()
+    if cur.isdigit() and int(cur) > 0:
+        with open(LEVEL_FILE, "w") as f:
+            f.write(cur)
+    open(OFF_FLAG, "w").close()
+    if not set_bl_power(1):
+        # No write access to bl_power yet: dim to 0 as a partial fallback
+        # (panel may still glow until the udev rule is applied).
+        bctl("set", "0")
+        print("note: bl_power not writable; backlight may still glow. "
+              "Apply the udev rule to fully power it off.", file=sys.stderr)
+
+
+def panel_power_on():
+    """Power the backlight back on and clear the off-flag. Must run BEFORE
+    re-enabling the output: while bl_power=1 the panel stops advertising its
+    modes, so mutter would report 'no usable mode'."""
+    try:
+        os.remove(OFF_FLAG)
+    except OSError:
+        pass
+    set_bl_power(0)
+
+
+def restore_brightness():
+    """Restore the remembered level (or half of max if unknown)."""
+    target = ""
+    try:
+        with open(LEVEL_FILE) as f:
+            target = f.read().strip()
+    except OSError:
+        pass
+    if not target.isdigit() or int(target) == 0:
+        mx = bctl("max").stdout.strip()
+        target = str(int(mx) // 2 if mx.isdigit() else 117)
+    bctl("set", target)
+
+IFACE = "org.gnome.Mutter.DisplayConfig"
+PATH = "/org/gnome/Mutter/DisplayConfig"
+STATE_T = GLib.VariantType(
+    "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
+)
+
+
+def get_state(bus):
+    res = bus.call_sync(IFACE, PATH, IFACE, "GetCurrentState", None,
+                        STATE_T, Gio.DBusCallFlags.NONE, -1, None)
+    return res.unpack()  # (serial, monitors, logical_monitors, properties)
+
+
+def current_mode_id(monitors, connector):
+    for spec, modes, _ in monitors:
+        if spec[0] == connector:
+            for mid, w, h, rate, ps, scales, mp in modes:
+                if mp.get("is-current"):
+                    return mid
+            # fall back to preferred if none current
+            for mid, w, h, rate, ps, scales, mp in modes:
+                if mp.get("is-preferred"):
+                    return mid
+    return None
+
+
+def device_len(mode_len, scale):
+    """Layout extent of a monitor edge, in logical coordinates: mode_len / scale.
+
+    A logical monitor's size in mutter's layout is always mode/scale
+    (e.g. 1800px @1.5 -> 1200), regardless of the fact that fractional
+    scaling renders to a larger framebuffer and downsamples. Using the
+    framebuffer size here left a gap below the primary, so DP-1 was placed
+    non-adjacent and ApplyMonitorsConfig rejected the layout.
+    """
+    return int(round(mode_len / scale))
+
+
+def mode_dims(monitors, connector, mode_id):
+    for spec, modes, _ in monitors:
+        if spec[0] == connector:
+            for mid, w, h, rate, ps, scales, mp in modes:
+                if mid == mode_id:
+                    return w, h
+    return None
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    serial, monitors, logical, _ = get_state(bus)
+
+    enabled = {conn for lm in logical for conn in (m[0] for m in lm[5])}
+    is_on = TARGET in enabled
+    if action == "toggle":
+        want_on = not is_on
+    else:
+        want_on = (action == "on")
+
+    if want_on == is_on:
+        print(f"ScreenPad already {'ON' if is_on else 'OFF'}")
+        return 0
+
+    if want_on:
+        # Power the panel on first, then poll state until DP-1 advertises its
+        # modes again (it reports none while bl_power=1, and the panel takes a
+        # variable moment to come back -- a fixed sleep is unreliable).
+        panel_power_on()
+        for _ in range(25):  # up to ~5s
+            time.sleep(0.2)
+            serial, monitors, logical, _ = get_state(bus)
+            if current_mode_id(monitors, TARGET) is not None:
+                break
+
+    # Rebuild logical monitors, preserving everything except DP-1.
+    new_logical = []
+    primary_lm = None
+    for x, y, scale, transform, primary, mons, props in logical:
+        conns = [m[0] for m in mons]
+        if TARGET in conns:
+            continue  # drop DP-1's old entry; re-added below if turning on
+        mon_cfg = [(c, current_mode_id(monitors, c), {}) for c in conns]
+        new_logical.append((x, y, scale, transform, primary, mon_cfg))
+        if primary:
+            primary_lm = (x, y, scale, transform, conns[0])
+
+    if want_on:
+        mid = current_mode_id(monitors, TARGET)
+        if mid is None:
+            print(f"{TARGET}: no usable mode", file=sys.stderr)
+            return 1
+        # Place DP-1 directly below the primary, in logical coordinates.
+        if primary_lm:
+            px, py, pscale, _, pconn = primary_lm
+            dims = mode_dims(monitors, pconn, current_mode_id(monitors, pconn))
+            ph = device_len(dims[1], pscale) if dims else 0
+            pos = (px, py + ph)
+        else:
+            pos = (0, 0)
+        new_logical.append((pos[0], pos[1], DP1_SCALE, 0, False,
+                            [(TARGET, mid, {})]))
+
+    # Cut the backlight before disabling the output (disabling the output
+    # alone leaves the ScreenPad panel lit).
+    if not want_on:
+        backlight_off()
+
+    args = GLib.Variant("(uua(iiduba(ssa{sv}))a{sv})",
+                        (serial, 2, new_logical, {}))
+    bus.call_sync(IFACE, PATH, IFACE, "ApplyMonitorsConfig", args, None,
+                  Gio.DBusCallFlags.NONE, -1, None)
+
+    # Restore the brightness level after the output is back.
+    if want_on:
+        restore_brightness()
+    print(f"ScreenPad: {'ON' if want_on else 'OFF'} (persisted)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

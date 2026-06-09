@@ -1,0 +1,7 @@
+# ScreenPad trackpad daemon (screenpad-trackpad): grant read access to the ELAN
+# touchscreens and write access to the uinput node via the plugdev group, which
+# the user is already in -- so this applies on a udev trigger with no relogin.
+# (A uaccess tag would need to run before 73-seat-late.rules; group/mode does not.)
+SUBSYSTEM=="input", ATTRS{name}=="ELAN9008:00 04F3:2F29", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="input", ATTRS{name}=="ELAN9009:00 04F3:2F2A", GROUP="plugdev", MODE="0660"
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="plugdev", MODE="0660", OPTIONS+="static_node=uinput"

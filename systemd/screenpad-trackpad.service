@@ -1,0 +1,13 @@
+[Unit]
+Description=ASUS ScreenPad Plus input daemon (absolute touch / relative trackpad)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/screenpad-trackpad-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
