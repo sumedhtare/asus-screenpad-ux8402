@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-apply ASUS ScreenPad Plus off-state (backlight) at login
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/screenpad-restore
+
+[Install]
+WantedBy=graphical-session.target

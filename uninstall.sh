@@ -9,14 +9,16 @@ ROOT=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 
-say "Stopping + disabling service"
+say "Stopping + disabling services"
 systemctl --user disable --now screenpad-trackpad.service 2>/dev/null || true
-rm -f "$UNIT_DIR/screenpad-trackpad.service"
+systemctl --user disable --now screenpad-restore.service 2>/dev/null || true
+rm -f "$UNIT_DIR/screenpad-trackpad.service" "$UNIT_DIR/screenpad-restore.service"
 systemctl --user daemon-reload 2>/dev/null || true
 
 say "Removing scripts"
 rm -f "$BIN"/screenpad-brightness "$BIN"/screenpad-toggle \
-      "$BIN"/screenpad-trackpad "$BIN"/screenpad-trackpad-daemon
+      "$BIN"/screenpad-trackpad "$BIN"/screenpad-trackpad-daemon \
+      "$BIN"/screenpad-restore
 
 say "Removing udev rules (sudo)"
 sudo rm -f /etc/udev/rules.d/90-screenpad-backlight.rules \

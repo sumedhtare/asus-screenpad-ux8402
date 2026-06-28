@@ -45,7 +45,9 @@ for brightness/power, `plugdev` for touch input) only applies to new logins.
 | `~/.local/bin/screenpad-toggle` | enable/disable the DP-1 output + backlight via mutter D-Bus (persisted to `monitors.xml`) |
 | `~/.local/bin/screenpad-trackpad` | flip the input daemon between touch/trackpad (drives the service) |
 | `~/.local/bin/screenpad-trackpad-daemon` | grabs the ScreenPad touchscreen, re-injects as virtual touch/trackpad |
+| `~/.local/bin/screenpad-restore` | at login, re-applies the backlight off-state if the ScreenPad was left off |
 | `~/.config/systemd/user/screenpad-trackpad.service` | runs the daemon, autostarts at login |
+| `~/.config/systemd/user/screenpad-restore.service` | oneshot at login, runs `screenpad-restore` |
 | `/etc/udev/rules.d/90-screenpad-backlight.rules` | `video` group write access to backlight/bl_power |
 | `/etc/udev/rules.d/91-screenpad-trackpad.rules` | `plugdev` access to the ELAN touchscreens + uinput |
 
@@ -103,3 +105,9 @@ journalctl --user -u screenpad-trackpad.service -f
   `bin/screenpad-trackpad-daemon`.
 - Brightness on/off depends on the `asus-wmi-screenpad` kernel module providing
   `/sys/class/backlight/asus_screenpad`.
+- mutter persists the ScreenPad *output* (DP-1) being off, but the panel
+  `bl_power` is a kernel attribute that resets to on (`0`) every boot — so after
+  a reboot the output stays disabled yet the backlight glows. The
+  `screenpad-restore` login service re-applies `bl_power=1` whenever the toggle's
+  off-flag (`~/.cache/screenpad-display.off`) is present, which is what keeps the
+  off-state holding across reboots.

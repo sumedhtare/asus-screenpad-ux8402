@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Re-apply the ScreenPad "off" state at login.
+#
+# mutter persists the DP-1 *output* being off (monitors.xml), but the panel
+# backlight (bl_power) is a kernel attribute that resets to 0 (on) every boot.
+# So after a reboot the output is disabled yet the backlight glows. This runs
+# once at login and, if the toggle's off-flag is set, powers the backlight off
+# again so the persisted state actually holds.
+DEV="asus_screenpad"
+OFF_FLAG="${XDG_CACHE_HOME:-$HOME/.cache}/screenpad-display.off"
+BL_POWER="/sys/class/backlight/$DEV/bl_power"
+
+[ -e "$OFF_FLAG" ] || exit 0   # ScreenPad isn't supposed to be off; nothing to do
+
+# The backlight device + its udev-granted write access appear during boot; give
+# them a moment in case this service wins the race with udev.
+for _ in $(seq 1 25); do      # up to ~5s
+  [ -w "$BL_POWER" ] && break
+  sleep 0.2
+done
+
+if [ -w "$BL_POWER" ]; then
+  echo 1 > "$BL_POWER" && exit 0
+fi
+echo "screenpad-restore: $BL_POWER not writable; backlight may still glow." >&2
+exit 1

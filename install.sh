@@ -35,6 +35,7 @@ install -m 0755 "$REPO"/bin/screenpad-brightness      "$BIN/"
 install -m 0755 "$REPO"/bin/screenpad-toggle          "$BIN/"
 install -m 0755 "$REPO"/bin/screenpad-trackpad        "$BIN/"
 install -m 0755 "$REPO"/bin/screenpad-trackpad-daemon "$BIN/"
+install -m 0755 "$REPO"/bin/screenpad-restore         "$BIN/"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "NOTE: $BIN is not on PATH; add it to ~/.profile";; esac
 
 # ---- 3. udev rules (sudo) --------------------------------------------------
@@ -55,9 +56,13 @@ done
 say "Installing + enabling the input daemon service"
 mkdir -p "$UNIT_DIR"
 install -m 0644 "$REPO"/systemd/screenpad-trackpad.service "$UNIT_DIR/"
+install -m 0644 "$REPO"/systemd/screenpad-restore.service  "$UNIT_DIR/"
 systemctl --user daemon-reload
 systemctl --user enable --now screenpad-trackpad.service || \
   echo "WARN: could not start service now (run 'systemctl --user start screenpad-trackpad.service' after login)"
+# Re-applies the off-state backlight at each login; only acts when the off-flag is set.
+systemctl --user enable screenpad-restore.service || \
+  echo "WARN: could not enable screenpad-restore.service (run 'systemctl --user enable screenpad-restore.service')"
 
 # ---- 5. GNOME keyboard shortcuts ------------------------------------------
 if [ "$DO_KEYS" = 1 ] && command -v gsettings >/dev/null; then
